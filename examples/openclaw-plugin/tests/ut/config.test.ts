@@ -27,6 +27,9 @@ describe("memoryOpenVikingConfigSchema.parse()", () => {
     expect(cfg.isolateUserScopeByAgent).toBe(false);
     expect(cfg.isolateAgentScopeByUser).toBe(false);
     expect(cfg.emitStandardDiagnostics).toBe(false);
+    expect(cfg.agentExperience.enabled).toBe(false);
+    expect(cfg.agentExperience.autoRecall).toBe(true);
+    expect(cfg.agentExperience.gatedAutoRecall).toBe(true);
   });
 
   it("defaults recallMaxInjectedChars to the 4000-character memory budget", () => {

@@ -145,7 +145,8 @@ describe("context-engine assemble()", () => {
       expect(result.messages[0]).toBe(sourceMessages[0]);
       expect(result.messages[1]).toBe(sourceMessages[1]);
       expect(result.messages[2]?.role).toBe("user");
-      expect(result.messages[2]?.content).toMatch(/^<relevant-memories>/);
+      expect(result.messages[2]?.content).toMatch(/^<openviking-context>/);
+      expect(result.messages[2]?.content).toContain("## Long-term Memories");
       expect(result.messages[2]?.content).toContain("Source: openviking-auto-recall");
       expect(result.messages[2]?.content).toContain("User prefers Rust for backend tasks.");
       expect(result.messages[2]?.content).toContain("what backend language should we use?");
@@ -153,6 +154,265 @@ describe("context-engine assemble()", () => {
     } finally {
       vi.unstubAllGlobals();
     }
+  });
+
+  it("keeps experience memories out of Long-term Memories and renders them in Agent Experiences", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({
+        ok: true,
+        json: async () => ({ status: "ok" }),
+      }),
+    );
+    try {
+      const { engine, client } = makeEngine(
+        {
+          latest_archive_overview: "",
+          pre_archive_abstracts: [],
+          messages: [],
+          estimatedTokens: 0,
+          stats: makeStats(),
+        },
+        {
+          cfgOverrides: {
+            autoRecall: true,
+            recallPreferAbstract: true,
+            agentExperience: {
+              enabled: true,
+              autoRecall: true,
+              gatedAutoRecall: true,
+              recallLimit: 3,
+              scoreThreshold: 0.35,
+              maxInjectedChars: 6000,
+              minQueryChars: 12,
+            },
+          },
+        },
+      );
+
+      const experienceHit = {
+        uri: "viking://agent/main/memories/experiences/openclaw-plugin-file-write-guard.md",
+        level: 2,
+        category: "experience",
+        abstract: "经验摘要",
+        score: 0.91,
+      };
+      const longTermHit = {
+        uri: "viking://user/default/memories/profile.md",
+        level: 2,
+        category: "profile",
+        abstract: "张明的主要技术栈是 Elixir 和 Zig。",
+        score: 0.83,
+      };
+
+      client.find
+        .mockResolvedValueOnce({
+          memories: [experienceHit],
+          total: 1,
+        })
+        .mockResolvedValueOnce({
+          memories: [longTermHit],
+          total: 1,
+        })
+        .mockResolvedValueOnce({
+          memories: [experienceHit],
+          total: 1,
+        });
+
+      client.read.mockImplementation(async (uri: string) => {
+        if (uri === experienceHit.uri) {
+          return [
+            "## Situation",
+            "- 当修改 OpenClaw 插件 afterTurn 写回逻辑时。",
+            "",
+            "## Approach",
+            "- 在写回 OV session 前剥离注入上下文块。",
+            "",
+            "## Reflect",
+            "- 避免把注入经验再次写回 transcript。",
+          ].join("\n");
+        }
+        if (uri === longTermHit.uri) {
+          return "张明的主要技术栈是 Elixir 和 Zig。";
+        }
+        return "";
+      });
+
+      const result = await engine.assemble({
+        sessionId: "session-transform-experience",
+        messages: [
+          { role: "assistant", content: [{ type: "text", text: "Previous answer." }] },
+          { role: "user", content: "修一下 OpenClaw 插件里 afterTurn 写回 session 的问题，并告诉我张明的技术栈。" },
+        ],
+      });
+
+      const injected = String(result.messages[1]?.content ?? "");
+      expect(injected).toContain("## Agent Experiences");
+      expect(injected).toContain("### Experience: openclaw-plugin-file-write-guard");
+      expect(injected).toContain("## Long-term Memories");
+      expect(injected).toContain("张明的主要技术栈是 Elixir 和 Zig。");
+
+      const longTermSection = injected.split("## Long-term Memories")[1] ?? "";
+      expect(longTermSection).not.toContain("### Experience:");
+      expect(longTermSection).not.toContain("剥离注入上下文块");
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("recalls agent experiences without task gating when gatedAutoRecall is false", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({
+        ok: true,
+        json: async () => ({ status: "ok" }),
+      }),
+    );
+    try {
+      const { engine, client } = makeEngine(
+        {
+          latest_archive_overview: "",
+          pre_archive_abstracts: [],
+          messages: [],
+          estimatedTokens: 0,
+          stats: makeStats(),
+        },
+        {
+          cfgOverrides: {
+            autoRecall: false,
+            agentExperience: {
+              enabled: true,
+              autoRecall: true,
+              gatedAutoRecall: false,
+            },
+          },
+        },
+      );
+      const experienceHit = {
+        uri: "viking://agent/main/memories/experiences/assemble-boundary.md",
+        level: 2,
+        category: "experience",
+        abstract: "经验摘要",
+        score: 0.91,
+      };
+      client.find.mockResolvedValueOnce({
+        memories: [experienceHit],
+        total: 1,
+      });
+      client.read.mockResolvedValueOnce([
+        "## Situation",
+        "- 当用户询问 assemble 边界时。",
+        "",
+        "## Approach",
+        "- 直接召回相关经验。",
+        "",
+        "## Reflect",
+        "- gatedAutoRecall=false 时不要做执行型任务 gate。",
+      ].join("\n"));
+
+      const result = await engine.assemble({
+        sessionId: "session-transform-experience-ungated",
+        messages: [
+          { role: "assistant", content: [{ type: "text", text: "Previous answer." }] },
+          { role: "user", content: "preflight assemble 和 transformcontext assemble是什么区别" },
+        ],
+      });
+
+      const injected = String(result.messages[1]?.content ?? "");
+      expect(client.find).toHaveBeenCalledWith(
+        "preflight assemble 和 transformcontext assemble是什么区别",
+        expect.objectContaining({
+          targetUri: "viking://agent/memories/experiences",
+        }),
+        "agent:session-transform-experience-ungated",
+      );
+      expect(injected).toContain("## Agent Experiences");
+      expect(injected).toContain("gatedAutoRecall=false 时不要做执行型任务 gate");
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("does not recall agent experiences by default", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({
+        ok: true,
+        json: async () => ({ status: "ok" }),
+      }),
+    );
+    try {
+      const { engine, client } = makeEngine(
+        {
+          latest_archive_overview: "",
+          pre_archive_abstracts: [],
+          messages: [],
+          estimatedTokens: 0,
+          stats: makeStats(),
+        },
+        {
+          cfgOverrides: {
+            autoRecall: false,
+          },
+        },
+      );
+
+      const result = await engine.assemble({
+        sessionId: "session-experience-default-off",
+        messages: [
+          { role: "assistant", content: [{ type: "text", text: "Previous answer." }] },
+          { role: "user", content: "修一下 OpenClaw 插件里 afterTurn 写回 session 的问题" },
+        ],
+      });
+
+      expect(client.find).not.toHaveBeenCalled();
+      expect(result.messages[1]?.content).toBe("修一下 OpenClaw 插件里 afterTurn 写回 session 的问题");
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("does not inject again when latest user message already has a legacy experience block", async () => {
+    const { engine, getClient } = makeEngine(
+      {
+        latest_archive_overview: "unused",
+        pre_archive_abstracts: [],
+        messages: [],
+        estimatedTokens: 0,
+        stats: makeStats(),
+      },
+      {
+        cfgOverrides: {
+          autoRecall: true,
+          agentExperience: {
+            enabled: true,
+            autoRecall: true,
+          },
+        },
+      },
+    );
+    const sourceMessages = [
+      { role: "assistant", content: [{ type: "text", text: "Previous answer." }] },
+      {
+        role: "user",
+        content: [
+          "<openviking-agent-experiences>",
+          "legacy injected experience",
+          "</openviking-agent-experiences>",
+          "",
+          "修一下 OpenClaw 插件里 afterTurn 写回 session 的问题",
+        ].join("\n"),
+      },
+    ];
+
+    const result = await engine.assemble({
+      sessionId: "session-legacy-experience-block",
+      messages: sourceMessages,
+    });
+
+    expect(getClient).not.toHaveBeenCalled();
+    expect(result.messages).toBe(sourceMessages);
+    expect(result.estimatedTokens).toBe(roughEstimate(sourceMessages));
   });
 
   it("passes through transformContext messages when the latest message is not user", async () => {
@@ -195,6 +455,13 @@ describe("context-engine assemble()", () => {
       messages: [],
       estimatedTokens: 0,
       stats: makeStats(),
+    }, {
+      cfgOverrides: {
+        autoRecall: false,
+        agentExperience: {
+          autoRecall: false,
+        },
+      },
     });
     const sourceMessages = [
       { role: "assistant", content: [{ type: "text", text: "Previous answer." }] },

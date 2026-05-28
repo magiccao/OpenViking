@@ -53,6 +53,22 @@ export type MemoryOpenVikingConfig = {
   emitStandardDiagnostics?: boolean;
   /** When true, log tenant routing for semantic find and session writes (messages/commit) to the plugin logger. */
   logFindRequests?: boolean;
+  agentExperience?: {
+    enabled?: boolean;
+    autoRecall?: boolean;
+    gatedAutoRecall?: boolean;
+    recallLimit?: number;
+    scoreThreshold?: number;
+    maxInjectedChars?: number;
+    minQueryChars?: number;
+  };
+};
+
+/** Runtime config after memoryOpenVikingConfigSchema.parse() has applied defaults. */
+export type ParsedMemoryOpenVikingConfig = Required<
+  Omit<MemoryOpenVikingConfig, "agentExperience">
+> & {
+  agentExperience: Required<NonNullable<MemoryOpenVikingConfig["agentExperience"]>>;
 };
 
 const DEFAULT_BASE_URL = "http://127.0.0.1:1933";
@@ -70,6 +86,15 @@ const DEFAULT_COMMIT_KEEP_RECENT_COUNT = 10;
 const DEFAULT_BYPASS_SESSION_PATTERNS: string[] = [];
 const DEFAULT_EMIT_STANDARD_DIAGNOSTICS = false;
 const DEFAULT_AGENT_PREFIX = "";
+const DEFAULT_AGENT_EXPERIENCE = {
+  enabled: false,
+  autoRecall: true,
+  gatedAutoRecall: true,
+  recallLimit: 3,
+  scoreThreshold: 0.35,
+  maxInjectedChars: 6000,
+  minQueryChars: 12,
+};
 
 function resolveAgentPrefix(configured: unknown): string {
   if (typeof configured === "string" && configured.trim()) {
@@ -118,6 +143,12 @@ function toStringArray(value: unknown, fallback: string[]): string[] {
   return fallback;
 }
 
+function toRecord(value: unknown): Record<string, unknown> {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : {};
+}
+
 /** True when env is 1 / true / yes (case-insensitive). Used for debug flags without editing plugin JSON. */
 function envFlag(name: string): boolean {
   const v = getEnv(name);
@@ -145,7 +176,7 @@ function resolveDefaultBaseUrl(): string {
 }
 
 export const memoryOpenVikingConfigSchema = {
-  parse(value: unknown): Required<MemoryOpenVikingConfig> {
+  parse(value: unknown): ParsedMemoryOpenVikingConfig {
     if (!value || typeof value !== "object" || Array.isArray(value)) {
       value = {};
     }
@@ -192,9 +223,11 @@ export const memoryOpenVikingConfigSchema = {
         "ingestReplyAssistIgnoreSessionPatterns",
         "emitStandardDiagnostics",
         "logFindRequests",
+        "agentExperience",
       ],
       "openviking config",
     );
+    const agentExperienceRaw = toRecord(cfg.agentExperience);
 
     const mode = "remote" as const;
     const rawBaseUrl = typeof cfg.baseUrl === "string" ? cfg.baseUrl : resolveDefaultBaseUrl();
@@ -323,6 +356,45 @@ export const memoryOpenVikingConfigSchema = {
         cfg.logFindRequests === true ||
         envFlag("OPENVIKING_LOG_ROUTING") ||
         envFlag("OPENVIKING_DEBUG"),
+      agentExperience: {
+        enabled:
+          typeof agentExperienceRaw.enabled === "boolean"
+            ? agentExperienceRaw.enabled
+            : DEFAULT_AGENT_EXPERIENCE.enabled,
+        autoRecall:
+          typeof agentExperienceRaw.autoRecall === "boolean"
+            ? agentExperienceRaw.autoRecall
+            : DEFAULT_AGENT_EXPERIENCE.autoRecall,
+        gatedAutoRecall:
+          typeof agentExperienceRaw.gatedAutoRecall === "boolean"
+            ? agentExperienceRaw.gatedAutoRecall
+            : DEFAULT_AGENT_EXPERIENCE.gatedAutoRecall,
+        recallLimit: Math.max(
+          1,
+          Math.min(
+            10,
+            Math.floor(toNumber(agentExperienceRaw.recallLimit, DEFAULT_AGENT_EXPERIENCE.recallLimit)),
+          ),
+        ),
+        scoreThreshold: Math.min(
+          1,
+          Math.max(0, toNumber(agentExperienceRaw.scoreThreshold, DEFAULT_AGENT_EXPERIENCE.scoreThreshold)),
+        ),
+        maxInjectedChars: Math.max(
+          500,
+          Math.min(
+            50_000,
+            Math.floor(toNumber(agentExperienceRaw.maxInjectedChars, DEFAULT_AGENT_EXPERIENCE.maxInjectedChars)),
+          ),
+        ),
+        minQueryChars: Math.max(
+          1,
+          Math.min(
+            500,
+            Math.floor(toNumber(agentExperienceRaw.minQueryChars, DEFAULT_AGENT_EXPERIENCE.minQueryChars)),
+          ),
+        ),
+      },
     };
   },
   uiHints: {

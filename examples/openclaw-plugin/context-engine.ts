@@ -1,16 +1,22 @@
 import { createHash } from "node:crypto";
 import { DEFAULT_PHASE2_POLL_TIMEOUT_MS } from "./client.js";
 import type { OpenVikingClient, OVMessage } from "./client.js";
-import type { MemoryOpenVikingConfig } from "./config.js";
+import type { ParsedMemoryOpenVikingConfig } from "./config.js";
+import type { ExperienceRecallDecision } from "./auto-recall.js";
 import {
   AUTO_RECALL_SOURCE_MARKER,
+  buildAgentExperienceRecallContext,
   buildAutoRecallContext,
+  buildOpenVikingContextBlock,
+  isCronSession,
   prepareRecallQuery,
+  shouldRecallAgentExperience,
 } from "./auto-recall.js";
 import {
   compileSessionPatterns,
   getCaptureDecision,
   extractNewTurnMessages,
+  stripOpenVikingContextInjection,
   shouldBypassSession,
 } from "./text-utils.js";
 import {
@@ -246,7 +252,11 @@ function extractAgentMessageText(message: AgentMessage | undefined): string {
 }
 
 function hasAutoRecallBlock(message: AgentMessage | undefined): boolean {
-  return extractAgentMessageText(message).includes(AUTO_RECALL_SOURCE_MARKER);
+  const text = extractAgentMessageText(message);
+  return (
+    text.includes(AUTO_RECALL_SOURCE_MARKER) ||
+    /<openviking-context\b|<openviking-agent-experiences\b/i.test(text)
+  );
 }
 
 function prependTextToMessageContent(content: unknown, text: string): unknown {
@@ -875,7 +885,7 @@ export function createMemoryOpenVikingContextEngine(params: {
   id: string;
   name: string;
   version?: string;
-  cfg: Required<MemoryOpenVikingConfig>;
+  cfg: ParsedMemoryOpenVikingConfig;
   logger: Logger;
   getClient: () => Promise<OpenVikingClient>;
   /** Extra args help match hook-populated routing when OpenClaw provides sessionKey / OV session id. */
@@ -1128,7 +1138,9 @@ export function createMemoryOpenVikingContextEngine(params: {
             latestRole: latestMessage?.role ?? null,
           });
         }
-        if (!cfg.autoRecall) {
+        const longTermRecallEnabled = cfg.autoRecall;
+        const experienceRecallEnabled = cfg.agentExperience.enabled && cfg.agentExperience.autoRecall;
+        if (!longTermRecallEnabled && !experienceRecallEnabled) {
           return assemblePassthrough(OVSessionId, "transform_context_auto_recall_disabled", messages, originalTokens);
         }
         if (hasAutoRecallBlock(latestMessage)) {
@@ -1150,22 +1162,58 @@ export function createMemoryOpenVikingContextEngine(params: {
           const client = await getClient();
           const routingRef = assembleParams.sessionId ?? sessionKey ?? OVSessionId;
           const agentId = resolveAgentId(routingRef, sessionKey, OVSessionId);
-          const recall = await buildAutoRecallContext({
-            cfg,
-            client,
-            agentId,
-            queryText: recallQuery.query,
-            logger,
-            verbose: (message) => logger.info(message),
+          const triggerHint = isCronSession(sessionKey, assembleParams.runtimeContext)
+            ? "cron_start"
+            : "task_start";
+          const experienceDecision: ExperienceRecallDecision = cfg.agentExperience.gatedAutoRecall
+            ? shouldRecallAgentExperience({
+                latestUserText: recallQuery.query,
+                sessionKey,
+                runtimeContext: assembleParams.runtimeContext,
+                triggerHint,
+                minQueryChars: cfg.agentExperience.minQueryChars,
+                isBypassed: false,
+              })
+            : {
+                recall: true,
+                trigger: triggerHint,
+                score: 99,
+                reason: "gate_disabled",
+              };
+          const experienceRecall = experienceRecallEnabled && experienceDecision.recall
+            ? await buildAgentExperienceRecallContext({
+                cfg,
+                client,
+                agentId,
+                queryText: recallQuery.query,
+                trigger: experienceDecision.trigger ?? "task_start",
+                logger,
+                verbose: (message) => logger.info(message),
+            })
+            : { count: 0, estimatedTokens: 0, skippedReason: experienceDecision.reason };
+          const recall = longTermRecallEnabled
+            ? await buildAutoRecallContext({
+                cfg,
+                client,
+                agentId,
+                queryText: recallQuery.query,
+                logger,
+                verbose: (message) => logger.info(message),
+              })
+            : { memoryCount: 0, estimatedTokens: 0 };
+
+          const combinedBlock = buildOpenVikingContextBlock({
+            sections: [experienceRecall.block, recall.block],
           });
 
-          if (!recall.block) {
+          if (!combinedBlock) {
             return assemblePassthrough(OVSessionId, "transform_context_no_recall_hits", messages, originalTokens, {
               memoryCount: recall.memoryCount,
+              experienceCount: experienceRecall.count,
             });
           }
 
-          const withRecall = prependRecallToLatestUserMessage(messages, recall.block);
+          const withRecall = prependRecallToLatestUserMessage(messages, combinedBlock);
           const estimatedTokens = roughEstimate(withRecall);
           diag("assemble_result", OVSessionId, {
             passthrough: false,
@@ -1175,6 +1223,8 @@ export function createMemoryOpenVikingContextEngine(params: {
             estimatedTokens,
             autoRecallMemoryCount: recall.memoryCount,
             autoRecallTokens: recall.estimatedTokens,
+            autoRecallExperienceCount: experienceRecall.count,
+            autoRecallExperienceTokens: experienceRecall.estimatedTokens,
             messages: messageDigest(withRecall),
           });
           return { messages: withRecall, estimatedTokens };
@@ -1357,10 +1407,7 @@ export function createMemoryOpenVikingContextEngine(params: {
           const ovParts = msg.parts.map((part) => {
             if (part.type === "text") {
               // 清理 relevant-memories 块
-              const cleaned = part.text
-                .replace(/<relevant-memories>[\s\S]*?<\/relevant-memories>/gi, " ")
-                .replace(/\s+/g, " ")
-                .trim();
+              const cleaned = stripOpenVikingContextInjection(part.text);
               return { type: "text" as const, text: cleaned };
             } else {
               return {
